@@ -29,6 +29,8 @@ import java.util.concurrent.TimeUnit;
  */
 public class SurfaceRelay implements SurfaceTexture.OnFrameAvailableListener {
     private static final String TAG = "SurfaceRelay";
+    private static final int MAX_EGL_RETRIES = 3;
+    private volatile int mEglRetryCount = 0;
 
     // EGL
     private EGLDisplay mEGLDisplay = EGL14.EGL_NO_DISPLAY;
@@ -183,7 +185,25 @@ public class SurfaceRelay implements SurfaceTexture.OnFrameAvailableListener {
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
 
             if (mEGLWindowSurface != EGL14.EGL_NO_SURFACE) {
-                EGL14.eglSwapBuffers(mEGLDisplay, mEGLWindowSurface);
+                if (!EGL14.eglSwapBuffers(mEGLDisplay, mEGLWindowSurface)) {
+                    int err = EGL14.eglGetError();
+                    LogUtil.log("【CS】【Relay】" + mTag + " eglSwapBuffers 失败, err=" + err
+                            + " retry=" + mEglRetryCount);
+                    if (err == EGL14.EGL_BAD_SURFACE
+                            || err == EGL14.EGL_BAD_NATIVE_WINDOW
+                            || err == 0x300B /* EGL_BAD_ALLOC = 12299 */) {
+                        // Window surface died — destroy it; next frame will recreate
+                        EGL14.eglMakeCurrent(mEGLDisplay,
+                                mEGLPbufferSurface, mEGLPbufferSurface, mEGLContext);
+                        EGL14.eglDestroySurface(mEGLDisplay, mEGLWindowSurface);
+                        mEGLWindowSurface = EGL14.EGL_NO_SURFACE;
+                        mEglRetryCount++;
+                        LogUtil.log("【CS】【Relay】" + mTag
+                                + " WindowSurface 已销毁，下帧重试 (" + mEglRetryCount + ")");
+                    }
+                } else {
+                    mEglRetryCount = 0; // successful swap
+                }
             }
         } catch (Exception e) {
             LogUtil.log("【CS】【Relay】" + mTag + " drawFrame 异常: " + e);
@@ -289,6 +309,27 @@ public class SurfaceRelay implements SurfaceTexture.OnFrameAvailableListener {
 
         mVertexBuffer = GLHelper.createFloatBuffer(GLHelper.VERTICES);
         mTexCoordBuffer = GLHelper.createFloatBuffer(GLHelper.TEX_COORDS);
+    }
+
+    /**
+     * Called by Camera2SessionHook when the target app (e.g. Giggle/Tango)
+     * recreates its SurfaceTexture. Forces a fresh window surface next frame.
+     */
+    public void updateTargetSurface(Surface newSurface) {
+        if (mGLHandler == null || mReleased) return;
+        mGLHandler.post(() -> {
+            LogUtil.log("【CS】【Relay】" + mTag + " updateTargetSurface: 绑定新 Surface");
+            mTargetSurface = newSurface;
+            mEglRetryCount = 0;
+            // Destroy the stale window surface so drawFrame() will recreate it next frame
+            if (mEGLWindowSurface != EGL14.EGL_NO_SURFACE) {
+                EGL14.eglMakeCurrent(mEGLDisplay,
+                        mEGLPbufferSurface, mEGLPbufferSurface, mEGLContext);
+                EGL14.eglDestroySurface(mEGLDisplay, mEGLWindowSurface);
+                mEGLWindowSurface = EGL14.EGL_NO_SURFACE;
+                LogUtil.log("【CS】【Relay】" + mTag + " 旧 WindowSurface 已清除，等待重建");
+            }
+        });
     }
 
     public void release() {
