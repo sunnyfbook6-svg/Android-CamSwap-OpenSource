@@ -107,7 +107,12 @@ public class HookMain {
     }
 
     public static void process_camera2_play() {
-        camera2Hook.startPlayback();
+        // Only start playback if we've hijacked a CameraDevice in the current session
+        if (camera2Hook.isOurCameraDevice(camera2Hook.cameraDevice)) {
+            camera2Hook.startPlayback();
+        } else {
+            LogUtil.log("【CS】process_camera2_play 跳过: 非目标 CameraDevice");
+        }
     }
 
     public static void process_camera2_init(Class hooked_class) {

@@ -106,6 +106,9 @@ public final class Camera2SessionHook {
     private HandlerThread whatsappYuvPumpThread;
     private Handler whatsappYuvPumpHandler;
 
+    // Tracked CameraDevice instance for this session
+    private volatile android.hardware.camera2.CameraDevice cameraDevice;
+
     // Photo Fake: 等待 build() 时触发
     /** YUV surfaces that were kept (not replaced) in the current session's OutputConfigurations. */
     private final Set<Surface> sessionKeptYuvSurfaces = Collections
@@ -147,6 +150,14 @@ public final class Camera2SessionHook {
     /** Public accessor for Camera2Handler to check/redirect surfaces. */
     public Surface getVirtualSurface() {
         return virtualSurface;
+    }
+
+    /** Check if the given CameraDevice belongs to our hooked session. */
+    public boolean isOurCameraDevice(android.hardware.camera2.CameraDevice device) {
+        if (device == null || cameraDevice == null) {
+            return false;
+        }
+        return device.equals(cameraDevice);
     }
 
     /** Mark virtual surface for recreation on next session creation. */
@@ -240,15 +251,22 @@ public final class Camera2SessionHook {
             return;
         }
 
-        // onOpened
-        try {
-            Method m = resolveMethodOnClass(hookedClass, "onOpened", CameraDevice.class);
-            Api101Runtime.requireModule().hook(m).intercept(chain -> {
-                Object[] args = toArgs(chain.getArgs());
-                try {
-                    isReleasing = false;
-                    needRecreate = true;
-                    createVirtualSurface();
+         // onOpened
+         try {
+             Method m = resolveMethodOnClass(hookedClass, "onOpened", CameraDevice.class);
+             Api101Runtime.requireModule().hook(m).intercept(chain -> {
+                 Object[] args = toArgs(chain.getArgs());
+                 try {
+                     // Guard: only act on our tracked StateCallback instance
+                     Object thisObj = chain.getThisObject();
+                     if (HookMain.c2_state_cb != null && !thisObj.equals(HookMain.c2_state_cb)) {
+                         return chain.proceed(args);
+                     }
+                     isReleasing = false;
+                     needRecreate = true;
+                     // Track our CameraDevice
+                     cameraDevice = (CameraDevice) args[0];
+                     createVirtualSurface();
                     playerManager.releaseCamera2Resources();
                     releaseImageWriters(false);
                     previewSurface1 = null;
@@ -307,12 +325,21 @@ public final class Camera2SessionHook {
             Api101Runtime.requireModule().hook(m).intercept(chain -> {
                 Object[] args = toArgs(chain.getArgs());
                 try {
+                    // Guard: only act on our tracked StateCallback instance
+                    Object thisObj = chain.getThisObject();
+                    if (HookMain.c2_state_cb != null && !thisObj.equals(HookMain.c2_state_cb)) {
+                        return chain.proceed(args);
+                    }
                     LogUtil.log("【CS】相机关闭 onClosed，释放播放器资源");
                     setBypassCurrentSession(false);
                     yuvBridgeSessionReady = false;
                     stopAllWhatsAppYuvPumps();
                     playerManager.releaseCamera2Resources();
                     releaseImageWriters();
+                    // Clear tracked CameraDevice if it's ours
+                    if (cameraDevice != null && cameraDevice.equals(args[0])) {
+                        cameraDevice = null;
+                    }
                 } catch (Throwable t) {
                     LogUtil.log("【CS】onClosed before 异常: " + t);
                 }
@@ -328,7 +355,24 @@ public final class Camera2SessionHook {
             Api101Runtime.requireModule().hook(m).intercept(chain -> {
                 Object[] args = toArgs(chain.getArgs());
                 try {
+                    // Guard: only act on our tracked StateCallback instance
+                    Object thisObj = chain.getThisObject();
+                    if (HookMain.c2_state_cb != null && !thisObj.equals(HookMain.c2_state_cb)) {
+                        return chain.proceed(args);
+                    }
                     LogUtil.log("【CS】相机错误onerror：" + (int) args[1]);
+                    // Clear tracked CameraDevice if it's ours
+                    if (cameraDevice != null && cameraDevice.equals(args[0])) {
+                        cameraDevice = null;
+                    }
+                } catch (Throwable t) {
+                    LogUtil.log("【CS】onError before 异常: " + t);
+                }
+                return chain.proceed(args);
+            });
+        } catch (Throwable t) {
+            LogUtil.log("【CS】Hook onError 失败: " + t);
+        }
                 } catch (Throwable t) {
                     LogUtil.log("【CS】onError before 异常: " + t);
                 }
@@ -344,12 +388,21 @@ public final class Camera2SessionHook {
             Api101Runtime.requireModule().hook(m).intercept(chain -> {
                 Object[] args = toArgs(chain.getArgs());
                 try {
+                    // Guard: only act on our tracked StateCallback instance
+                    Object thisObj = chain.getThisObject();
+                    if (HookMain.c2_state_cb != null && !thisObj.equals(HookMain.c2_state_cb)) {
+                        return chain.proceed(args);
+                    }
                     LogUtil.log("【CS】相机断开 onDisconnected，释放播放器资源");
                     setBypassCurrentSession(false);
                     yuvBridgeSessionReady = false;
                     stopAllWhatsAppYuvPumps();
                     playerManager.releaseCamera2Resources();
                     releaseImageWriters();
+                    // Clear tracked CameraDevice if it's ours
+                    if (cameraDevice != null && cameraDevice.equals(args[0])) {
+                        cameraDevice = null;
+                    }
                 } catch (Throwable t) {
                     LogUtil.log("【CS】onDisconnected before 异常: " + t);
                 }
@@ -822,223 +875,265 @@ public final class Camera2SessionHook {
             return;
         }
 
-        // 1. createCaptureSession(List, StateCallback, Handler)
-        try {
-            Method m = resolveMethodOnClass(deviceClass, "createCaptureSession",
-                    List.class, CameraCaptureSession.StateCallback.class, Handler.class);
-            Api101Runtime.requireModule().hook(m).intercept(chain -> {
-                Object[] args = toArgs(chain.getArgs());
-                try {
-                    if (args[0] != null) {
-                        if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
-                            yuvBridgeSessionReady = false;
-                            return chain.proceed(args);
-                        }
-                        if (shouldBypassWhatsAppYuvSession((List<?>) args[0], getCurrentPackageName())) {
-                            enableSessionBypass("createCaptureSession(List)");
-                        } else {
-                            disableSessionBypass();
-                        }
-                        LogUtil.log("【CS】createCaptureSession(List) outputs=" + ((List<?>) args[0]).size());
-                        if (!isCurrentSessionBypassed()) {
-                            resetSurfaceSlotsForNewSession();
-                            args[0] = rewriteSessionSurfaces((List<?>) args[0]);
-                        }
-                        if (args[1] != null)
-                            hookSessionCallback((CameraCaptureSession.StateCallback) args[1]);
-                    }
-                } catch (Throwable t) {
-                    LogUtil.log("【CS】createCaptureSession(List) before 异常: " + t);
-                }
-                return chain.proceed(args);
-            });
-        } catch (Throwable t) {
-            LogUtil.log("【CS】Hook createCaptureSession(List) 失败: " + t);
-        }
+         // 1. createCaptureSession(List, StateCallback, Handler)
+         try {
+             Method m = resolveMethodOnClass(deviceClass, "createCaptureSession",
+                     List.class, CameraCaptureSession.StateCallback.class, Handler.class);
+             Api101Runtime.requireModule().hook(m).intercept(chain -> {
+                 Object[] args = toArgs(chain.getArgs());
+                 try {
+                     // Check: only hijack our CameraDevice
+                     Object thisObj = chain.getThisObject();
+                     if (thisObj instanceof android.hardware.camera2.CameraDevice) {
+                         if (!isOurCameraDevice((android.hardware.camera2.CameraDevice) thisObj)) {
+                             return chain.proceed(args);
+                         }
+                     }
+                     if (args[0] != null) {
+                         if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
+                             yuvBridgeSessionReady = false;
+                             return chain.proceed(args);
+                         }
+                         if (shouldBypassWhatsAppYuvSession((List<?>) args[0], getCurrentPackageName())) {
+                             enableSessionBypass("createCaptureSession(List)");
+                         } else {
+                             disableSessionBypass();
+                         }
+                         LogUtil.log("【CS】createCaptureSession(List) outputs=" + ((List<?>) args[0]).size());
+                         if (!isCurrentSessionBypassed()) {
+                             resetSurfaceSlotsForNewSession();
+                             args[0] = rewriteSessionSurfaces((List<?>) args[0]);
+                         }
+                         if (args[1] != null)
+                             hookSessionCallback((CameraCaptureSession.StateCallback) args[1]);
+                     }
+                 } catch (Throwable t) {
+                     LogUtil.log("【CS】createCaptureSession(List) before 异常: " + t);
+                 }
+                 return chain.proceed(args);
+             });
+         } catch (Throwable t) {
+             LogUtil.log("【CS】Hook createCaptureSession(List) 失败: " + t);
+         }
 
-        // 2. createCaptureSessionByOutputConfigurations (API 24+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                Method m = resolveMethodOnClass(deviceClass,
-                        "createCaptureSessionByOutputConfigurations",
-                        List.class, CameraCaptureSession.StateCallback.class, Handler.class);
-                Api101Runtime.requireModule().hook(m).intercept(chain -> {
-                    Object[] args = toArgs(chain.getArgs());
-                    try {
-                        if (args[0] != null) {
-                            if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
-                                yuvBridgeSessionReady = false;
-                                return chain.proceed(args);
-                            }
-                            if (shouldBypassWhatsAppYuvSession((List<?>) args[0], getCurrentPackageName())) {
-                                enableSessionBypass("createCaptureSessionByOutputConfigurations");
-                            } else {
-                                disableSessionBypass();
-                            }
-                            if (!isCurrentSessionBypassed()) {
-                                resetSurfaceSlotsForNewSession();
-                                args[0] = rewriteOutputConfigurations((List<?>) args[0]);
-                            }
-                            LogUtil.log("【CS】createCaptureSession(OutputConfigurations)");
-                            if (args[1] != null)
-                                hookSessionCallback((CameraCaptureSession.StateCallback) args[1]);
-                        }
-                    } catch (Throwable t) {
-                        LogUtil.log("【CS】createCaptureSessionByOutputConfigurations before 异常: " + t);
-                    }
-                    return chain.proceed(args);
-                });
-            } catch (Throwable t) {
-                LogUtil.log("【CS】Hook createCaptureSessionByOutputConfigurations 失败: " + t);
-            }
-        }
+         // 2. createCaptureSessionByOutputConfigurations (API 24+)
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+             try {
+                 Method m = resolveMethodOnClass(deviceClass,
+                         "createCaptureSessionByOutputConfigurations",
+                         List.class, CameraCaptureSession.StateCallback.class, Handler.class);
+                 Api101Runtime.requireModule().hook(m).intercept(chain -> {
+                     Object[] args = toArgs(chain.getArgs());
+                     try {
+                         // Check: only hijack our CameraDevice
+                         Object thisObj = chain.getThisObject();
+                         if (thisObj instanceof android.hardware.camera2.CameraDevice) {
+                             if (!isOurCameraDevice((android.hardware.camera2.CameraDevice) thisObj)) {
+                                 return chain.proceed(args);
+                             }
+                         }
+                         if (args[0] != null) {
+                             if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
+                                 yuvBridgeSessionReady = false;
+                                 return chain.proceed(args);
+                             }
+                             if (shouldBypassWhatsAppYuvSession((List<?>) args[0], getCurrentPackageName())) {
+                                 enableSessionBypass("createCaptureSessionByOutputConfigurations");
+                             } else {
+                                 disableSessionBypass();
+                             }
+                             if (!isCurrentSessionBypassed()) {
+                                 resetSurfaceSlotsForNewSession();
+                                 args[0] = rewriteOutputConfigurations((List<?>) args[0]);
+                             }
+                             LogUtil.log("【CS】createCaptureSession(OutputConfigurations)");
+                             if (args[1] != null)
+                                 hookSessionCallback((CameraCaptureSession.StateCallback) args[1]);
+                         }
+                     } catch (Throwable t) {
+                         LogUtil.log("【CS】createCaptureSessionByOutputConfigurations before 异常: " + t);
+                     }
+                     return chain.proceed(args);
+                 });
+             } catch (Throwable t) {
+                 LogUtil.log("【CS】Hook createCaptureSessionByOutputConfigurations 失败: " + t);
+             }
+         }
 
-        // 3. createConstrainedHighSpeedCaptureSession
-        try {
-            Method m = resolveMethodOnClass(deviceClass, "createConstrainedHighSpeedCaptureSession",
-                    List.class, CameraCaptureSession.StateCallback.class, Handler.class);
-            Api101Runtime.requireModule().hook(m).intercept(chain -> {
-                Object[] args = toArgs(chain.getArgs());
-                try {
-                    if (args[0] != null) {
-                        if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
-                            yuvBridgeSessionReady = false;
-                            return chain.proceed(args);
-                        }
-                        if (shouldBypassWhatsAppYuvSession((List<?>) args[0], getCurrentPackageName())) {
-                            enableSessionBypass("createConstrainedHighSpeedCaptureSession");
-                        } else {
-                            disableSessionBypass();
-                        }
-                        if (!isCurrentSessionBypassed()) {
-                            resetSurfaceSlotsForNewSession();
-                            args[0] = rewriteSessionSurfaces((List<?>) args[0]);
-                        }
-                        LogUtil.log("【CS】createCaptureSession(HighSpeed)");
-                        if (args[1] != null)
-                            hookSessionCallback((CameraCaptureSession.StateCallback) args[1]);
-                    }
-                } catch (Throwable t) {
-                    LogUtil.log("【CS】createConstrainedHighSpeedCaptureSession before 异常: " + t);
-                }
-                return chain.proceed(args);
-            });
-        } catch (Throwable t) {
-            LogUtil.log("【CS】Hook createConstrainedHighSpeedCaptureSession 失败: " + t);
-        }
+         // 3. createConstrainedHighSpeedCaptureSession
+         try {
+             Method m = resolveMethodOnClass(deviceClass, "createConstrainedHighSpeedCaptureSession",
+                     List.class, CameraCaptureSession.StateCallback.class, Handler.class);
+             Api101Runtime.requireModule().hook(m).intercept(chain -> {
+                 Object[] args = toArgs(chain.getArgs());
+                 try {
+                     // Check: only hijack our CameraDevice
+                     Object thisObj = chain.getThisObject();
+                     if (thisObj instanceof android.hardware.camera2.CameraDevice) {
+                         if (!isOurCameraDevice((android.hardware.camera2.CameraDevice) thisObj)) {
+                             return chain.proceed(args);
+                         }
+                     }
+                     if (args[0] != null) {
+                         if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
+                             yuvBridgeSessionReady = false;
+                             return chain.proceed(args);
+                         }
+                         if (shouldBypassWhatsAppYuvSession((List<?>) args[0], getCurrentPackageName())) {
+                             enableSessionBypass("createConstrainedHighSpeedCaptureSession");
+                         } else {
+                             disableSessionBypass();
+                         }
+                         if (!isCurrentSessionBypassed()) {
+                             resetSurfaceSlotsForNewSession();
+                             args[0] = rewriteSessionSurfaces((List<?>) args[0]);
+                         }
+                         LogUtil.log("【CS】createCaptureSession(HighSpeed)");
+                         if (args[1] != null)
+                             hookSessionCallback((CameraCaptureSession.StateCallback) args[1]);
+                     }
+                 } catch (Throwable t) {
+                     LogUtil.log("【CS】createConstrainedHighSpeedCaptureSession before 异常: " + t);
+                 }
+                 return chain.proceed(args);
+             });
+         } catch (Throwable t) {
+             LogUtil.log("【CS】Hook createConstrainedHighSpeedCaptureSession 失败: " + t);
+         }
 
-        // 4. createReprocessableCaptureSession (API 23+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            try {
-                Method m = resolveMethodOnClass(deviceClass, "createReprocessableCaptureSession",
-                        InputConfiguration.class, List.class,
-                        CameraCaptureSession.StateCallback.class, Handler.class);
-                Api101Runtime.requireModule().hook(m).intercept(chain -> {
-                    Object[] args = toArgs(chain.getArgs());
-                    try {
-                        if (args[1] != null) {
-                            if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
-                                yuvBridgeSessionReady = false;
-                                return chain.proceed(args);
-                            }
-                            if (shouldBypassWhatsAppYuvSession((List<?>) args[1], getCurrentPackageName())) {
-                                enableSessionBypass("createReprocessableCaptureSession");
-                            } else {
-                                disableSessionBypass();
-                            }
-                            if (!isCurrentSessionBypassed()) {
-                                resetSurfaceSlotsForNewSession();
-                                args[1] = rewriteSessionSurfaces((List<?>) args[1]);
-                            }
-                            LogUtil.log("【CS】createCaptureSession(Reprocessable)");
-                            if (args[2] != null)
-                                hookSessionCallback((CameraCaptureSession.StateCallback) args[2]);
-                        }
-                    } catch (Throwable t) {
-                        LogUtil.log("【CS】createReprocessableCaptureSession before 异常: " + t);
-                    }
-                    return chain.proceed(args);
-                });
-            } catch (Throwable t) {
-                LogUtil.log("【CS】Hook createReprocessableCaptureSession 失败: " + t);
-            }
-        }
+         // 4. createReprocessableCaptureSession (API 23+)
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+             try {
+                 Method m = resolveMethodOnClass(deviceClass, "createReprocessableCaptureSession",
+                         InputConfiguration.class, List.class,
+                         CameraCaptureSession.StateCallback.class, Handler.class);
+                 Api101Runtime.requireModule().hook(m).intercept(chain -> {
+                     Object[] args = toArgs(chain.getArgs());
+                     try {
+                         // Check: only hijack our CameraDevice
+                         Object thisObj = chain.getThisObject();
+                         if (thisObj instanceof android.hardware.camera2.CameraDevice) {
+                             if (!isOurCameraDevice((android.hardware.camera2.CameraDevice) thisObj)) {
+                                 return chain.proceed(args);
+                             }
+                         }
+                         if (args[1] != null) {
+                             if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
+                                 yuvBridgeSessionReady = false;
+                                 return chain.proceed(args);
+                             }
+                             if (shouldBypassWhatsAppYuvSession((List<?>) args[1], getCurrentPackageName())) {
+                                 enableSessionBypass("createReprocessableCaptureSession");
+                             } else {
+                                 disableSessionBypass();
+                             }
+                             if (!isCurrentSessionBypassed()) {
+                                 resetSurfaceSlotsForNewSession();
+                                 args[1] = rewriteSessionSurfaces((List<?>) args[1]);
+                             }
+                             LogUtil.log("【CS】createCaptureSession(Reprocessable)");
+                             if (args[2] != null)
+                                 hookSessionCallback((CameraCaptureSession.StateCallback) args[2]);
+                         }
+                     } catch (Throwable t) {
+                         LogUtil.log("【CS】createReprocessableCaptureSession before 异常: " + t);
+                     }
+                     return chain.proceed(args);
+                 });
+             } catch (Throwable t) {
+                 LogUtil.log("【CS】Hook createReprocessableCaptureSession 失败: " + t);
+             }
+         }
 
-        // 5. createReprocessableCaptureSessionByConfigurations (API 24+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                Method m = resolveMethodOnClass(deviceClass,
-                        "createReprocessableCaptureSessionByConfigurations",
-                        InputConfiguration.class, List.class,
-                        CameraCaptureSession.StateCallback.class, Handler.class);
-                Api101Runtime.requireModule().hook(m).intercept(chain -> {
-                    Object[] args = toArgs(chain.getArgs());
-                    try {
-                        if (args[1] != null) {
-                            if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
-                                yuvBridgeSessionReady = false;
-                                return chain.proceed(args);
-                            }
-                            if (shouldBypassWhatsAppYuvSession((List<?>) args[1], getCurrentPackageName())) {
-                                enableSessionBypass("createReprocessableCaptureSessionByConfigurations");
-                            } else {
-                                disableSessionBypass();
-                            }
-                            if (!isCurrentSessionBypassed()) {
-                                resetSurfaceSlotsForNewSession();
-                                args[1] = rewriteOutputConfigurations((List<?>) args[1]);
-                            }
-                            LogUtil.log("【CS】createCaptureSession(ReprocessableByConfigs)");
-                            if (args[2] != null)
-                                hookSessionCallback((CameraCaptureSession.StateCallback) args[2]);
-                        }
-                    } catch (Throwable t) {
-                        LogUtil.log("【CS】createReprocessableCaptureSessionByConfigurations before 异常: " + t);
-                    }
-                    return chain.proceed(args);
-                });
-            } catch (Throwable t) {
-                LogUtil.log("【CS】Hook createReprocessableCaptureSessionByConfigurations 失败: " + t);
-            }
-        }
+         // 5. createReprocessableCaptureSessionByConfigurations (API 24+)
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+             try {
+                 Method m = resolveMethodOnClass(deviceClass,
+                         "createReprocessableCaptureSessionByConfigurations",
+                         InputConfiguration.class, List.class,
+                         CameraCaptureSession.StateCallback.class, Handler.class);
+                 Api101Runtime.requireModule().hook(m).intercept(chain -> {
+                     Object[] args = toArgs(chain.getArgs());
+                     try {
+                         // Check: only hijack our CameraDevice
+                         Object thisObj = chain.getThisObject();
+                         if (thisObj instanceof android.hardware.camera2.CameraDevice) {
+                             if (!isOurCameraDevice((android.hardware.camera2.CameraDevice) thisObj)) {
+                                 return chain.proceed(args);
+                             }
+                         }
+                         if (args[1] != null) {
+                             if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
+                                 yuvBridgeSessionReady = false;
+                                 return chain.proceed(args);
+                             }
+                             if (shouldBypassWhatsAppYuvSession((List<?>) args[1], getCurrentPackageName())) {
+                                 enableSessionBypass("createReprocessableCaptureSessionByConfigurations");
+                             } else {
+                                 disableSessionBypass();
+                             }
+                             if (!isCurrentSessionBypassed()) {
+                                 resetSurfaceSlotsForNewSession();
+                                 args[1] = rewriteOutputConfigurations((List<?>) args[1]);
+                             }
+                             LogUtil.log("【CS】createCaptureSession(ReprocessableByConfigs)");
+                             if (args[2] != null)
+                                 hookSessionCallback((CameraCaptureSession.StateCallback) args[2]);
+                         }
+                     } catch (Throwable t) {
+                         LogUtil.log("【CS】createReprocessableCaptureSessionByConfigurations before 异常: " + t);
+                     }
+                     return chain.proceed(args);
+                 });
+             } catch (Throwable t) {
+                 LogUtil.log("【CS】Hook createReprocessableCaptureSessionByConfigurations 失败: " + t);
+             }
+         }
 
-        // 6. createCaptureSession(SessionConfiguration) (API 28+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            try {
-                Method m = resolveMethodOnClass(deviceClass, "createCaptureSession",
-                        SessionConfiguration.class);
-                Api101Runtime.requireModule().hook(m).intercept(chain -> {
-                    Object[] args = toArgs(chain.getArgs());
-                    try {
-                        if (args[0] != null) {
-                            if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
-                                yuvBridgeSessionReady = false;
-                                return chain.proceed(args);
-                            }
-                            LogUtil.log("【CS】createCaptureSession(SessionConfig)");
-                            realSessionConfig = (SessionConfiguration) args[0];
-                            if (shouldBypassWhatsAppYuvSession(realSessionConfig.getOutputConfigurations(),
-                                    getCurrentPackageName())) {
-                                enableSessionBypass("createCaptureSession(SessionConfiguration)");
-                            } else {
-                                disableSessionBypass();
-                            }
-                            if (!isCurrentSessionBypassed()) {
-                                resetSurfaceSlotsForNewSession();
-                                fakeSessionConfig = rewriteSessionConfiguration(realSessionConfig);
-                                args[0] = fakeSessionConfig;
-                            }
-                            hookSessionCallback(realSessionConfig.getStateCallback());
-                        }
-                    } catch (Throwable t) {
-                        LogUtil.log("【CS】createCaptureSession(SessionConfiguration) before 异常: " + t);
-                    }
-                    return chain.proceed(args);
-                });
-            } catch (Throwable t) {
-                LogUtil.log("【CS】Hook createCaptureSession(SessionConfiguration) 失败: " + t);
-            }
-        }
+         // 6. createCaptureSession(SessionConfiguration) (API 28+)
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+             try {
+                 Method m = resolveMethodOnClass(deviceClass, "createCaptureSession",
+                         SessionConfiguration.class);
+                 Api101Runtime.requireModule().hook(m).intercept(chain -> {
+                     Object[] args = toArgs(chain.getArgs());
+                     try {
+                         // Check: only hijack our CameraDevice
+                         Object thisObj = chain.getThisObject();
+                         if (thisObj instanceof android.hardware.camera2.CameraDevice) {
+                             if (!isOurCameraDevice((android.hardware.camera2.CameraDevice) thisObj)) {
+                                 return chain.proceed(args);
+                             }
+                         }
+                         if (args[0] != null) {
+                             if (HookGuards.shouldBypass(getCurrentPackageName(), HookGuards.getCurrentVideoFile())) {
+                                 yuvBridgeSessionReady = false;
+                                 return chain.proceed(args);
+                             }
+                             LogUtil.log("【CS】createCaptureSession(SessionConfig)");
+                             realSessionConfig = (SessionConfiguration) args[0];
+                             if (shouldBypassWhatsAppYuvSession(realSessionConfig.getOutputConfigurations(),
+                                     getCurrentPackageName())) {
+                                 enableSessionBypass("createCaptureSession(SessionConfiguration)");
+                             } else {
+                                 disableSessionBypass();
+                             }
+                             if (!isCurrentSessionBypassed()) {
+                                 resetSurfaceSlotsForNewSession();
+                                 fakeSessionConfig = rewriteSessionConfiguration(realSessionConfig);
+                                 args[0] = fakeSessionConfig;
+                             }
+                             hookSessionCallback(realSessionConfig.getStateCallback());
+                         }
+                     } catch (Throwable t) {
+                         LogUtil.log("【CS】createCaptureSession(SessionConfiguration) before 异常: " + t);
+                     }
+                     return chain.proceed(args);
+                 });
+             } catch (Throwable t) {
+                 LogUtil.log("【CS】Hook createCaptureSession(SessionConfiguration) 失败: " + t);
+             }
+         }
     }
 
     // =====================================================================

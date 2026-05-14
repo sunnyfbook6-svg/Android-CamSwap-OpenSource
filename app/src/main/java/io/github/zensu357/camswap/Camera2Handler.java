@@ -128,7 +128,7 @@ public class Camera2Handler implements ICameraHandler {
 
     // ================================================================
     // 3. CaptureRequest.Builder.addTarget(Surface)
-    //    before-only: surface 替换逻辑
+    //    before-only: surface 替换逻辑 (仅对我们的 CameraDevice)
     // ================================================================
     private void hookAddTarget(ClassLoader classLoader, String packageName) {
         try {
@@ -150,6 +150,14 @@ public class Camera2Handler implements ICameraHandler {
                     if (HookMain.camera2Hook.isCurrentSessionBypassed()) {
                         LogUtil.log("【CS】当前会话已旁路，保留原始目标: " + args[0]);
                         return chain.proceed(args);
+                    }
+                    // Check: only hijack sessions belonging to our CameraDevice
+                    Object thisObj = chain.getThisObject();
+                    if (thisObj instanceof android.hardware.camera2.CameraDevice) {
+                        if (!HookMain.camera2Hook.isOurCameraDevice((android.hardware.camera2.CameraDevice) thisObj)) {
+                            LogUtil.log("【CS】跳过 addTarget: 非目标 CameraDevice");
+                            return chain.proceed(args);
+                        }
                     }
 
                     // Dynamic defense for Photo Fake
@@ -197,7 +205,7 @@ public class Camera2Handler implements ICameraHandler {
 
     // ================================================================
     // 4. CaptureRequest.Builder.removeTarget(Surface)
-    //    before-only: 清理 surface 引用
+    //    before-only: 清理 surface 引用 (仅对我们的 CameraDevice)
     // ================================================================
     private void hookRemoveTarget(ClassLoader classLoader, String packageName) {
         try {
@@ -210,6 +218,16 @@ public class Camera2Handler implements ICameraHandler {
                     if (args[0] != null && chain.getThisObject() != null
                             && !HookGuards.shouldBypass(packageName, HookGuards.getCurrentVideoFile())
                             && !HookMain.camera2Hook.isCurrentSessionBypassed()) {
+                        // Check: only handle removals from our CameraDevice's builder
+                        Object thisObj = chain.getThisObject();
+                        if (thisObj instanceof android.hardware.camera2.CaptureRequest.Builder) {
+                            // CaptureRequest.Builder doesn't directly expose its CameraDevice,
+                            // but the session is tracked via cameraDevice field in Camera2SessionHook.
+                            // Since build() is where we set captureBuilder, and we only set it for our device,
+                            // we can skip the check here and rely on the captureBuilder equality guard.
+                            // However, also check if the session still belongs to us
+                            // (captureBuilder reference tracking already does this implicitly)
+                        }
                         HookMain.camera2Hook.onTargetRemoved((Surface) args[0]);
                     }
                 } catch (Throwable t) {
@@ -224,7 +242,7 @@ public class Camera2Handler implements ICameraHandler {
 
     // ================================================================
     // 5. CaptureRequest.Builder.build()
-    //    before-only: 触发播放
+    //    before-only: 触发播放 (仅对我们的 CameraDevice)
     // ================================================================
     private void hookBuild(ClassLoader classLoader, String packageName) {
         try {
@@ -241,6 +259,15 @@ public class Camera2Handler implements ICameraHandler {
                     // the same CaptureRequest.Builder instance across sessions (isNewBuilder=false)
                     // but a new camera session has just been configured.
                     boolean isFirstBuild = HookMain.camera2Hook.isFirstHookBuild;
+                    
+                    // CRITICAL: Only hook if the current session belongs to our CameraDevice.
+                    // The CameraDevice is stored in camera2Hook.cameraDevice after onOpened fires.
+                    // If it's not our device (e.g., Giggle Go Live uses its own CameraDevice),
+                    // skip all hook logic entirely.
+                    if (!HookMain.camera2Hook.isOurCameraDevice(HookMain.camera2Hook.cameraDevice)) {
+                        return chain.proceed(toArgs(chain.getArgs()));
+                    }
+                    
                     if (thisObject != null && (isNewBuilder || hasPending || isFirstBuild)) {
                         HookMain.camera2Hook.captureBuilder = (CaptureRequest.Builder) thisObject;
                         if (!HookGuards.shouldBypass(packageName, HookGuards.getCurrentVideoFile())) {

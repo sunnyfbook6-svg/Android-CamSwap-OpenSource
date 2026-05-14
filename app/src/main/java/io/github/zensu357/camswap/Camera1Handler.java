@@ -480,7 +480,7 @@ public class Camera1Handler implements ICameraHandler {
         hookCameraMethod(classLoader, "setPreviewCallbackWithBuffer",
                 new Class<?>[] { Camera.PreviewCallback.class }, chain -> {
                     Object[] args = toArgs(chain.getArgs());
-                    if (args[0] != null) {
+                    if (args[0] != null && isOurCamera(chain.getThisObject())) {
                         processCallbackRegistration(args[0]);
                     }
                     return chain.proceed(args);
@@ -490,20 +490,8 @@ public class Camera1Handler implements ICameraHandler {
     private void hookAddCallbackBuffer(ClassLoader classLoader) {
         hookCameraMethod(classLoader, "addCallbackBuffer", new Class<?>[] { byte[].class }, chain -> {
             Object[] args = toArgs(chain.getArgs());
-            if (args[0] != null) {
-                Object thisObj = chain.getThisObject();
-                boolean isTargetCamera = false;
-                if (thisObj != null) {
-                    if (thisObj.equals(HookMain.origin_preview_camera) ||
-                        thisObj.equals(HookMain.start_preview_camera) ||
-                        thisObj.equals(HookMain.mcamera1) ||
-                        thisObj.equals(HookMain.camera_onPreviewFrame)) {
-                        isTargetCamera = true;
-                    }
-                }
-                if (isTargetCamera) {
-                    args[0] = new byte[((byte[]) args[0]).length];
-                }
+            if (args[0] != null && isOurCamera(chain.getThisObject())) {
+                args[0] = new byte[((byte[]) args[0]).length];
             }
             return chain.proceed(args);
         });
@@ -512,7 +500,7 @@ public class Camera1Handler implements ICameraHandler {
     private void hookSetPreviewCallback(ClassLoader classLoader) {
         hookCameraMethod(classLoader, "setPreviewCallback", new Class<?>[] { Camera.PreviewCallback.class }, chain -> {
             Object[] args = toArgs(chain.getArgs());
-            if (args[0] != null) {
+            if (args[0] != null && isOurCamera(chain.getThisObject())) {
                 processCallbackRegistration(args[0]);
             }
             return chain.proceed(args);
@@ -523,7 +511,7 @@ public class Camera1Handler implements ICameraHandler {
         hookCameraMethod(classLoader, "setOneShotPreviewCallback", new Class<?>[] { Camera.PreviewCallback.class },
                 chain -> {
                     Object[] args = toArgs(chain.getArgs());
-                    if (args[0] != null) {
+                    if (args[0] != null && isOurCamera(chain.getThisObject())) {
                         processCallbackRegistration(args[0]);
                     }
                     return chain.proceed(args);
@@ -532,19 +520,23 @@ public class Camera1Handler implements ICameraHandler {
 
     private void hookStopPreview(ClassLoader classLoader) {
         hookCameraMethod(classLoader, "stopPreview", new Class<?>[0], chain -> {
-            LogUtil.log("【CS】Camera1 stopPreview，释放播放器资源");
-            HookMain.playerManager.releaseCamera1Resources();
+            if (isOurCamera(chain.getThisObject())) {
+                LogUtil.log("【CS】Camera1 stopPreview，释放播放器资源");
+                HookMain.playerManager.releaseCamera1Resources();
+            }
             return chain.proceed(toArgs(chain.getArgs()));
         });
     }
 
     private void hookRelease(ClassLoader classLoader) {
         hookCameraMethod(classLoader, "release", new Class<?>[0], chain -> {
-            LogUtil.log("【CS】Camera1 release，释放播放器资源");
-            HookMain.playerManager.releaseCamera1Resources();
-            HookMain.origin_preview_camera = null;
-            HookMain.start_preview_camera = null;
-            HookMain.camera_onPreviewFrame = null;
+            if (isOurCamera(chain.getThisObject())) {
+                LogUtil.log("【CS】Camera1 release，释放播放器资源");
+                HookMain.playerManager.releaseCamera1Resources();
+                HookMain.origin_preview_camera = null;
+                HookMain.start_preview_camera = null;
+                HookMain.camera_onPreviewFrame = null;
+            }
             return chain.proceed(toArgs(chain.getArgs()));
         });
     }
@@ -577,6 +569,17 @@ public class Camera1Handler implements ICameraHandler {
 
     private static Object[] toArgs(List<Object> args) {
         return args.toArray(new Object[0]);
+    }
+
+    private boolean isOurCamera(Object camera) {
+        if (camera == null) {
+            return false;
+        }
+        Camera target = (Camera) camera;
+        return target.equals(HookMain.origin_preview_camera)
+                || target.equals(HookMain.start_preview_camera)
+                || target.equals(HookMain.mcamera1)
+                || target.equals(HookMain.camera_onPreviewFrame);
     }
 
     /**
