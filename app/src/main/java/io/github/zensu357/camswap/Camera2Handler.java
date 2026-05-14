@@ -64,32 +64,18 @@ public class Camera2Handler implements ICameraHandler {
                     if (args[1] != null) {
                         File file = HookGuards.resolveVideoFile(true);
                         if (!HookGuards.shouldBypass(packageName, file)) {
-                            // Always reset isFirstHookBuild on every openCamera call
+                            // Always reset isFirstHookBuild on every openCamera call so that
+                            // build() → process_camera2_play() fires for the new session,
+                            // even when Giggle reuses the same StateCallback instance.
                             HookMain.camera2Hook.isFirstHookBuild = true;
-                            if (HookMain.c2_state_cb == null) {
-                                // First StateCallback: capture and hook
+                            if (!args[1].equals(HookMain.c2_state_cb)) {
                                 HookMain.c2_state_cb = (CameraDevice.StateCallback) args[1];
                                 HookMain.c2_state_callback = args[1].getClass();
                                 LogUtil.log("【CS】1位参数初始化相机，类：" + HookMain.c2_state_callback.toString());
-                                HookMain.process_camera2_init(HookMain.c2_state_cb);
-                            } else if (!args[1].equals(HookMain.c2_state_cb)) {
-                                // Different StateCallback instance: skip to avoid hijacking other cameras
-                                LogUtil.log("【CS】检测到新的 StateCallback 实例，跳过重载");
+                                HookMain.process_camera2_init(HookMain.c2_state_callback);
                             } else {
-                                // Same callback instance: camera reopened
                                 LogUtil.log("【CS】1位参数重新打开相机（同一 StateCallback），重置播放状态");
                             }
-                        }
-                    }
-                } catch (Throwable t) {
-                    LogUtil.log("【CS】openCamera(3-arg) before 异常: " + t);
-                }
-                return chain.proceed(args);
-            });
-        } catch (Throwable t) {
-            LogUtil.log("【CS】Hook openCamera(3-arg) 失败: " + t);
-        }
-    }
                         }
                     }
                 } catch (Throwable t) {
@@ -120,27 +106,14 @@ public class Camera2Handler implements ICameraHandler {
                         if (!HookGuards.shouldBypass(packageName, file)) {
                             // Always reset isFirstHookBuild on every openCamera call.
                             HookMain.camera2Hook.isFirstHookBuild = true;
-                            if (HookMain.c2_state_cb == null) {
+                            if (!args[2].equals(HookMain.c2_state_cb)) {
                                 HookMain.c2_state_cb = (CameraDevice.StateCallback) args[2];
                                 HookMain.c2_state_callback = args[2].getClass();
                                 LogUtil.log("【CS】2位参数初始化相机，类：" + HookMain.c2_state_callback.toString());
-                                HookMain.process_camera2_init(HookMain.c2_state_cb);
-                            } else if (!args[2].equals(HookMain.c2_state_cb)) {
-                                LogUtil.log("【CS】检测到新的 StateCallback 实例（2位参数），跳过重载");
+                                HookMain.process_camera2_init(HookMain.c2_state_callback);
                             } else {
                                 LogUtil.log("【CS】2位参数重新打开相机（同一 StateCallback），重置播放状态");
                             }
-                        }
-                    }
-                } catch (Throwable t) {
-                    LogUtil.log("【CS】openCamera(executor) after 异常: " + t);
-                }
-                return result;
-            });
-        } catch (Throwable t) {
-            LogUtil.log("【CS】Hook openCamera(executor) 失败: " + t);
-        }
-    }
                         }
                     }
                 } catch (Throwable t) {
@@ -168,66 +141,6 @@ public class Camera2Handler implements ICameraHandler {
                     if (args[0] == null || chain.getThisObject() == null) {
                         return chain.proceed(args);
                     }
-                    if (((Surface) args[0]).equals(HookMain.camera2Hook.getVirtualSurface())) {
-                        return chain.proceed(args);
-                    }
-                    if (HookGuards.shouldBypass(packageName, HookGuards.getCurrentVideoFile())) {
-                        return chain.proceed(args);
-                    }
-                    if (HookMain.camera2Hook.isCurrentSessionBypassed()) {
-                        LogUtil.log("【CS】当前会话已旁路，保留原始目标: " + args[0]);
-                        return chain.proceed(args);
-                    }
-                    // Only intercept builders belonging to our target CameraDevice
-                    Object builder = chain.getThisObject();
-                    android.hardware.camera2.CameraDevice device = HookMain.camera2Hook.getBuilderCameraDevice(builder);
-                    if (device != null && !HookMain.camera2Hook.isOurCameraDevice(device)) {
-                        LogUtil.log("【CS】跳过 addTarget: 非目标 CameraDevice");
-                        return chain.proceed(args);
-                    }
-
-                    // Dynamic defense for Photo Fake
-                    if (VideoManager.getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, false)
-                            && HookMain.camera2Hook.isTrackedReaderSurface((Surface) args[0])) {
-                        LogUtil.log("【CS】检测到 ImageReader Surface 在 addTarget: " + args[0]);
-                        if (HookMain.camera2Hook.isJpegReaderSurface((Surface) args[0])) {
-                            HookMain.camera2Hook.markPendingJpegCapture((Surface) args[0]);
-                            LogUtil.log("【CS】保留 JPEG ImageReader 目标用于拍照: " + args[0]);
-                            return chain.proceed(args);
-                        }
-                    }
-
-                    Surface originalSurface = (Surface) args[0];
-                    if (HookMain.camera2Hook.shouldKeepYuvReaderSurfaceForCurrentPackage(originalSurface)) {
-                        LogUtil.log("【CS】YUV ImageReader 目标保留原始输出: "
-                                + packageName + " -> " + originalSurface);
-                        return chain.proceed(args);
-                    }
-                    if (HookMain.camera2Hook.isTrackedReaderSurface(originalSurface)) {
-                        HookMain.camera2Hook.rememberReaderPlaybackSurface(originalSurface);
-                        if (HookMain.camera2Hook.shouldKeepRealReaderSurfaceForCurrentPackage(originalSurface)) {
-                            LogUtil.log("【CS】保留兼容性 ImageReader 目标: " + originalSurface);
-                            return chain.proceed(args);
-                        }
-                    } else {
-                        HookMain.camera2Hook.rememberPreviewSurface(originalSurface);
-                    }
-                    LogUtil.log("【CS】添加目标：" + originalSurface.toString());
-                    // Ensure virtual surface exists (lazy creation if onOpened hook didn't fire)
-                    Surface vSurface = HookMain.camera2Hook.getVirtualSurface();
-                    if (vSurface == null || !vSurface.isValid()) {
-                        vSurface = HookMain.camera2Hook.ensureVirtualSurface();
-                    }
-                    args[0] = vSurface;
-                } catch (Throwable t) {
-                    LogUtil.log("【CS】addTarget before 异常: " + t);
-                }
-                return chain.proceed(args);
-            });
-        } catch (Throwable t) {
-            LogUtil.log("【CS】Hook addTarget 失败: " + t);
-        }
-    }
                     if (((Surface) args[0]).equals(HookMain.camera2Hook.getVirtualSurface())) {
                         return chain.proceed(args);
                     }
@@ -294,15 +207,10 @@ public class Camera2Handler implements ICameraHandler {
             Api101Runtime.requireModule().hook(method).intercept(chain -> {
                 Object[] args = toArgs(chain.getArgs());
                 try {
-                    Object builder = chain.getThisObject();
-                    if (args[0] != null && builder != null
+                    if (args[0] != null && chain.getThisObject() != null
                             && !HookGuards.shouldBypass(packageName, HookGuards.getCurrentVideoFile())
                             && !HookMain.camera2Hook.isCurrentSessionBypassed()) {
-                        // Only handle removals from builders belonging to our CameraDevice
-                        android.hardware.camera2.CameraDevice device = HookMain.camera2Hook.getBuilderCameraDevice(builder);
-                        if (device != null && HookMain.camera2Hook.isOurCameraDevice(device)) {
-                            HookMain.camera2Hook.onTargetRemoved((Surface) args[0]);
-                        }
+                        HookMain.camera2Hook.onTargetRemoved((Surface) args[0]);
                     }
                 } catch (Throwable t) {
                     LogUtil.log("【CS】removeTarget before 异常: " + t);
@@ -316,7 +224,7 @@ public class Camera2Handler implements ICameraHandler {
 
     // ================================================================
     // 5. CaptureRequest.Builder.build()
-    //    before-only: 触发播放 (仅对我们的 CameraDevice)
+    //    before-only: 触发播放
     // ================================================================
     private void hookBuild(ClassLoader classLoader, String packageName) {
         try {
@@ -325,21 +233,16 @@ public class Camera2Handler implements ICameraHandler {
                     "build");
             Api101Runtime.requireModule().hook(method).intercept(chain -> {
                 try {
-                    Object builder = chain.getThisObject();
-                    boolean isNewBuilder = builder != null
-                            && !builder.equals(HookMain.camera2Hook.captureBuilder);
+                    Object thisObject = chain.getThisObject();
+                    boolean isNewBuilder = thisObject != null
+                            && !thisObject.equals(HookMain.camera2Hook.captureBuilder);
                     boolean hasPending = HookMain.camera2Hook.pendingPlayback;
+                    // Also trigger on isFirstHookBuild: covers the case where Giggle reuses
+                    // the same CaptureRequest.Builder instance across sessions (isNewBuilder=false)
+                    // but a new camera session has just been configured.
                     boolean isFirstBuild = HookMain.camera2Hook.isFirstHookBuild;
-
-                    // Determine which CameraDevice this builder belongs to
-                    android.hardware.camera2.CameraDevice device = HookMain.camera2Hook.getBuilderCameraDevice(builder);
-                    // Only proceed if builder's CameraDevice matches our tracked device
-                    if (device == null || !HookMain.camera2Hook.isOurCameraDevice(device)) {
-                        return chain.proceed(toArgs(chain.getArgs()));
-                    }
-
-                    if (builder != null && (isNewBuilder || hasPending || isFirstBuild)) {
-                        HookMain.camera2Hook.captureBuilder = (CaptureRequest.Builder) builder;
+                    if (thisObject != null && (isNewBuilder || hasPending || isFirstBuild)) {
+                        HookMain.camera2Hook.captureBuilder = (CaptureRequest.Builder) thisObject;
                         if (!HookGuards.shouldBypass(packageName, HookGuards.getCurrentVideoFile())) {
                             if (HookMain.camera2Hook.isCurrentSessionBypassed()) {
                                 LogUtil.log("【CS】当前会话已旁路，跳过虚拟播放启动");
