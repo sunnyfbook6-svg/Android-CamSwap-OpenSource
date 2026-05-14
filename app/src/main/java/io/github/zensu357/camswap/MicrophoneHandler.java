@@ -546,8 +546,10 @@ public class MicrophoneHandler implements ICameraHandler {
         hookMethod(classLoader, "android.media.AudioRecord", "read",
                 new Class<?>[] { ByteBuffer.class, int.class }, chain -> {
                     Object[] args = toArgs(chain.getArgs());
+                    ByteBuffer buffer = (ByteBuffer) args[0];
+                    int initialPos = buffer != null ? buffer.position() : 0;
                     Object result = chain.proceed(args);
-                    replaceByteBufferResult(chain.getThisObject(), (ByteBuffer) args[0], intResult(result), "ByteBuffer");
+                    replaceByteBufferResult(chain.getThisObject(), buffer, intResult(result), "ByteBuffer", initialPos);
                     return result;
                 }, "AudioRecord.read(ByteBuffer, int)");
     }
@@ -567,9 +569,11 @@ public class MicrophoneHandler implements ICameraHandler {
         hookMethod(classLoader, "android.media.AudioRecord", "read",
                 new Class<?>[] { ByteBuffer.class, int.class, int.class }, chain -> {
                     Object[] args = toArgs(chain.getArgs());
+                    ByteBuffer buffer = (ByteBuffer) args[0];
+                    int initialPos = buffer != null ? buffer.position() : 0;
                     Object result = chain.proceed(args);
-                    replaceByteBufferResult(chain.getThisObject(), (ByteBuffer) args[0], intResult(result),
-                            "ByteBuffer(int,int)");
+                    replaceByteBufferResult(chain.getThisObject(), buffer, intResult(result),
+                            "ByteBuffer(int,int)", initialPos);
                     return result;
                 }, "AudioRecord.read(ByteBuffer, int, int)");
     }
@@ -589,32 +593,28 @@ public class MicrophoneHandler implements ICameraHandler {
                 }, "MediaRecorder.setAudioSource(int)");
     }
 
-    private static void replaceByteBufferResult(Object audioRecord, ByteBuffer buffer, int result, String methodTag) {
+    private static void replaceByteBufferResult(Object audioRecord, ByteBuffer buffer, int result, String methodTag, int initialPos) {
         if (!isMicHookEnabled() || result <= 0 || buffer == null) {
             return;
         }
-        int pos = buffer.position();
+        int posAfterRead = buffer.position();
         AudioRecordParams p = getParams(audioRecord);
 
         logReadCall(result, methodTag);
 
+        buffer.position(initialPos);
         if (isVideoSyncMode()) {
             long posMs = getVideoPlaybackPositionMs();
-            buffer.position(pos - result);
             AudioDataProvider.fillByteBufferAtPosition(buffer, result,
                     p.sampleRate, p.channelCount, posMs);
-            buffer.position(pos);
         } else if (isReplaceMode()) {
-            buffer.position(pos - result);
             AudioDataProvider.fillByteBuffer(buffer, result,
                     p.sampleRate, p.channelCount);
-            buffer.position(pos);
         } else {
             byte[] zeros = new byte[result];
-            buffer.position(pos - result);
             buffer.put(zeros);
-            buffer.position(pos);
         }
+        buffer.position(posAfterRead);
     }
 
     private static void replaceFloatArrayResult(Object audioRecord, float[] buffer, int offset, int result,
