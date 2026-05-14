@@ -182,36 +182,54 @@ public class GLVideoRenderer implements SurfaceTexture.OnFrameAvailableListener 
         mGLHandler.post(this::drawFrame);
     }
 
+    // ---- Surface-lost state ----
+    // When the target app (Giggle/Tango) destroys its SurfaceTexture during an
+    // activity switch, mEGLSurface becomes invalid. We tear it down immediately
+    // and suspend rendering until updateTargetSurface() supplies a live Surface.
+    private volatile boolean mWaitingForSurface = false;
+
     private void drawFrame() {
         if (mReleased || !mInitialized)
             return;
-        // Target surface temporarily invalid — wait for updateTargetSurface() instead of stopping
-        if (mTargetSurface != null && !mTargetSurface.isValid()) {
-            LogUtil.log("【CS】【GL】" + mTag + " target surface 已失效，等待重建...");
-            return; // do NOT set mReleased = true
+
+        // Suspended: target surface was lost; waiting for updateTargetSurface()
+        if (mWaitingForSurface) {
+            return;
         }
+
+        // Pre-check: if the target Surface is already invalid, enter waiting state now
+        // rather than letting eglSwapBuffers fail first.
+        if (mTargetSurface == null || !mTargetSurface.isValid()) {
+            LogUtil.log("【CS】【GL】" + mTag + " target surface 无效，进入等待状态");
+            tearDownEGLSurface();
+            mWaitingForSurface = true;
+            return;
+        }
+
+        // Guard: no EGL surface yet (torn down, waiting for updateTargetSurface to rebuild)
+        if (mEGLSurface == EGL14.EGL_NO_SURFACE) {
+            return;
+        }
+
         try {
             renderToBackBuffer();
             if (!EGL14.eglSwapBuffers(mEGLDisplay, mEGLSurface)) {
                 int err = EGL14.eglGetError();
-                LogUtil.log("【CS】【GL】" + mTag + " eglSwapBuffers 失败, err=" + err
-                        + " retry=" + mEglRetryCount);
+                LogUtil.log("【CS】【GL】" + mTag + " eglSwapBuffers 失败, err=" + err);
                 if (err == EGL14.EGL_BAD_SURFACE
                         || err == EGL14.EGL_BAD_NATIVE_WINDOW
-                        || err == 0x300B /* EGL_BAD_ALLOC = 12299 */) {
-                    // Surface was recycled by target app (Giggle/Tango pattern).
-                    // Rebuild the EGL surface and keep rendering.
-                    if (mEglRetryCount < MAX_EGL_RETRIES) {
-                        mEglRetryCount++;
-                        LogUtil.log("【CS】【GL】" + mTag + " 尝试重建 EGL Surface ("
-                                + mEglRetryCount + "/" + MAX_EGL_RETRIES + ")");
-                        recreateEGLSurface();
-                    } else {
-                        LogUtil.log("【CS】【GL】" + mTag + " EGL 重试次数耗尽，停止渲染");
-                        mReleased = true;
-                    }
+                        || err == 0x300B  /* EGL_BAD_ALLOC   = 12291 */
+                        || err == 0x3009  /* EGL_BAD_MATCH    = 12297 */
+                        || err == 12301   /* EGL_CONTEXT_LOST = 12301 */) {
+                    // The target app recycled its Surface (Giggle/Tango activity switch).
+                    // Tear down the dead EGL surface and suspend until a new Surface arrives
+                    // via updateTargetSurface(). Do NOT retry on the same dead Surface.
+                    LogUtil.log("【CS】【GL】" + mTag + " Surface 已失效，销毁 EGL Surface，等待新 Surface");
+                    tearDownEGLSurface();
+                    mWaitingForSurface = true;
                 } else {
-                    // Unknown EGL error — stop
+                    // Unknown EGL error — stop entirely
+                    LogUtil.log("【CS】【GL】" + mTag + " 未知 EGL 错误，停止渲染 err=" + err);
                     mReleased = true;
                 }
             } else {
@@ -223,69 +241,67 @@ public class GLVideoRenderer implements SurfaceTexture.OnFrameAvailableListener 
     }
 
     /**
+     * Detach context and destroy the EGL window surface without touching mEGLContext/mEGLDisplay.
+     * Safe to call multiple times. GL thread only.
+     */
+    private void tearDownEGLSurface() {
+        EGL14.eglMakeCurrent(mEGLDisplay,
+                EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+        if (mEGLSurface != EGL14.EGL_NO_SURFACE) {
+            EGL14.eglDestroySurface(mEGLDisplay, mEGLSurface);
+            mEGLSurface = EGL14.EGL_NO_SURFACE;
+        }
+    }
+
+    /**
      * Destroy the current EGL window surface and recreate it from mTargetSurface.
-     * Called on the GL thread only.
+     * Called on the GL thread only — from updateTargetSurface() when a live new Surface arrives.
      *
-     * Root cause of EGL_BAD_ALLOC (12291): the previous EGLSurface still holds
-     * a reference to the ANativeWindow when eglCreateWindowSurface is called again.
-     * Fix: detach context → destroy surface → brief yield → recreate.
+     * We no longer call this from drawFrame() retry loops. The correct flow is:
+     *   eglSwapBuffers fails → tearDownEGLSurface() + mWaitingForSurface=true
+     *   target app gives us a new Surface → updateTargetSurface() → recreateEGLSurface()
      */
     private void recreateEGLSurface() {
-        try {
-            // Step 1: detach context from any surface so the driver releases the native window
-            EGL14.eglMakeCurrent(mEGLDisplay,
-                    EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+        // Always start clean: detach context so driver fully releases the old ANativeWindow
+        tearDownEGLSurface();
 
-            // Step 2: destroy the old EGL surface
-            if (mEGLSurface != EGL14.EGL_NO_SURFACE) {
-                EGL14.eglDestroySurface(mEGLDisplay, mEGLSurface);
-                mEGLSurface = EGL14.EGL_NO_SURFACE;
-            }
+        if (mTargetSurface == null || !mTargetSurface.isValid() || mEGLConfig == null) {
+            LogUtil.log("【CS】【GL】" + mTag + " recreateEGLSurface: target surface 无效，中止");
+            return;
+        }
 
-            if (mTargetSurface == null || !mTargetSurface.isValid() || mEGLConfig == null) {
-                LogUtil.log("【CS】【GL】" + mTag + " recreateEGLSurface: target surface invalid, aborting");
-                return;
-            }
+        int[] surfaceAttribs = { EGL14.EGL_NONE };
+        mEGLSurface = EGL14.eglCreateWindowSurface(
+                mEGLDisplay, mEGLConfig, mTargetSurface, surfaceAttribs, 0);
 
-            // Step 3: yield briefly so the driver/platform fully releases the ANativeWindow
-            // before we try to attach a new EGLSurface to it. Without this pause,
-            // eglCreateWindowSurface returns EGL_BAD_ALLOC (0x300B / 12291).
-            try { Thread.sleep(16); } catch (InterruptedException ignored) {}
-
-            // Step 4: recreate
-            int[] surfaceAttribs = { EGL14.EGL_NONE };
-            mEGLSurface = EGL14.eglCreateWindowSurface(
-                    mEGLDisplay, mEGLConfig, mTargetSurface, surfaceAttribs, 0);
-
-            if (mEGLSurface != EGL14.EGL_NO_SURFACE) {
-                if (EGL14.eglMakeCurrent(mEGLDisplay, mEGLSurface, mEGLSurface, mEGLContext)) {
-                    LogUtil.log("【CS】【GL】" + mTag + " EGL Surface 重建成功 ✅");
-                    mEglRetryCount = 0;
-                } else {
-                    int err = EGL14.eglGetError();
-                    LogUtil.log("【CS】【GL】" + mTag + " eglMakeCurrent 失败 err=" + err);
-                    EGL14.eglDestroySurface(mEGLDisplay, mEGLSurface);
-                    mEGLSurface = EGL14.EGL_NO_SURFACE;
-                }
+        if (mEGLSurface != EGL14.EGL_NO_SURFACE) {
+            if (EGL14.eglMakeCurrent(mEGLDisplay, mEGLSurface, mEGLSurface, mEGLContext)) {
+                mWaitingForSurface = false;
+                mEglRetryCount = 0;
+                LogUtil.log("【CS】【GL】" + mTag + " EGL Surface 重建成功 ✅");
             } else {
                 int err = EGL14.eglGetError();
-                LogUtil.log("【CS】【GL】" + mTag + " EGL Surface 重建失败, err=" + err
-                        + " (0x300B=EGL_BAD_ALLOC — native window still busy?)");
-                // Schedule another attempt via the existing retry mechanism in drawFrame()
+                LogUtil.log("【CS】【GL】" + mTag + " eglMakeCurrent 失败 err=" + err);
+                EGL14.eglDestroySurface(mEGLDisplay, mEGLSurface);
+                mEGLSurface = EGL14.EGL_NO_SURFACE;
+                // Stay in mWaitingForSurface=true; caller can retry updateTargetSurface()
             }
-        } catch (Exception e) {
-            LogUtil.log("【CS】【GL】" + mTag + " recreateEGLSurface 异常: " + e);
+        } else {
+            int err = EGL14.eglGetError();
+            LogUtil.log("【CS】【GL】" + mTag + " EGL Surface 重建失败 err=" + err);
+            // Stay in mWaitingForSurface=true
         }
     }
 
     /**
      * Called by Camera2SessionHook when the target app (e.g. Giggle/Tango)
      * recreates its SurfaceTexture. Rebinds the EGL surface to the new Surface.
+     * This is the ONLY code path that should call recreateEGLSurface().
      */
     public void updateTargetSurface(Surface newSurface) {
         if (mGLHandler == null || mReleased) return;
         mGLHandler.post(() -> {
-            LogUtil.log("【CS】【GL】" + mTag + " updateTargetSurface: 绑定新 Surface");
+            LogUtil.log("【CS】【GL】" + mTag + " updateTargetSurface: 收到新 Surface，从等待状态恢复");
             mTargetSurface = newSurface;
             mEglRetryCount = 0;
             recreateEGLSurface();
