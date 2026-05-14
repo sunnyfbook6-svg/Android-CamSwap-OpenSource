@@ -48,12 +48,19 @@ public class Camera1Handler implements ICameraHandler {
         hookCameraMethod(classLoader, "setPreviewTexture", new Class<?>[] { SurfaceTexture.class }, chain -> {
             Object[] args = toArgs(chain.getArgs());
             try {
-                if (HookMain.origin_preview_camera == null
-                        || !HookMain.origin_preview_camera.equals(chain.getThisObject())) {
+                Camera thisCamera = (Camera) chain.getThisObject();
+                if (HookMain.origin_preview_camera == null) {
+                    // First camera: capture as target
+                    HookMain.origin_preview_camera = thisCamera;
                     VideoManager.updateVideoPath(true);
-                }
-                File file = HookGuards.getCurrentVideoFile();
-                if (!HookGuards.shouldBypass(packageName, file)) {
+                    LogUtil.log("【CS】创建预览");
+                } else if (!HookMain.origin_preview_camera.equals(thisCamera)) {
+                    // Different camera, skip
+                    LogUtil.log("【CS】跳过非目标 Camera1 setPreviewTexture");
+                    return chain.proceed(args);
+                } else {
+                    // Duplicate call on already captured camera
+                    LogUtil.log("【CS】发现重复" + HookMain.origin_preview_camera.toString());
                     if (HookMain.is_hooked) {
                         HookMain.is_hooked = false;
                         return chain.proceed(args);
@@ -64,18 +71,6 @@ public class Camera1Handler implements ICameraHandler {
                     if (args[0].equals(HookMain.c1_fake_texture)) {
                         return chain.proceed(args);
                     }
-
-                    if (HookMain.origin_preview_camera != null
-                            && HookMain.origin_preview_camera.equals(chain.getThisObject())) {
-                        args[0] = HookMain.fake_SurfaceTexture;
-                        LogUtil.log("【CS】发现重复" + HookMain.origin_preview_camera.toString());
-                        return chain.proceed(args);
-                    } else {
-                        LogUtil.log("【CS】创建预览");
-                    }
-
-                    HookMain.origin_preview_camera = (Camera) chain.getThisObject();
-                    HookMain.mSurfacetexture = (SurfaceTexture) args[0];
                     if (HookMain.fake_SurfaceTexture == null) {
                         HookMain.fake_SurfaceTexture = new SurfaceTexture(10);
                     } else {
@@ -83,7 +78,33 @@ public class Camera1Handler implements ICameraHandler {
                         HookMain.fake_SurfaceTexture = new SurfaceTexture(10);
                     }
                     args[0] = HookMain.fake_SurfaceTexture;
+                    return chain.proceed(args);
                 }
+
+                // Bypass / hook state checks
+                File file = HookGuards.getCurrentVideoFile();
+                if (HookGuards.shouldBypass(packageName, file)) {
+                    return chain.proceed(args);
+                }
+                if (HookMain.is_hooked) {
+                    HookMain.is_hooked = false;
+                    return chain.proceed(args);
+                }
+                if (args[0] == null) {
+                    return chain.proceed(args);
+                }
+                if (args[0].equals(HookMain.c1_fake_texture)) {
+                    return chain.proceed(args);
+                }
+
+                HookMain.mSurfacetexture = (SurfaceTexture) args[0];
+                if (HookMain.fake_SurfaceTexture == null) {
+                    HookMain.fake_SurfaceTexture = new SurfaceTexture(10);
+                } else {
+                    HookMain.fake_SurfaceTexture.release();
+                    HookMain.fake_SurfaceTexture = new SurfaceTexture(10);
+                }
+                args[0] = HookMain.fake_SurfaceTexture;
             } catch (Throwable t) {
                 LogUtil.log("【CS】setPreviewTexture before 异常: " + t);
             }
@@ -95,11 +116,17 @@ public class Camera1Handler implements ICameraHandler {
         hookCameraMethod(classLoader, "startPreview", new Class<?>[0], chain -> {
             Object[] args = toArgs(chain.getArgs());
             try {
+                Camera thisCamera = (Camera) chain.getThisObject();
+                // Only hijack our target camera
+                if (!isOurCamera(thisCamera)) {
+                    LogUtil.log("【CS】跳过非目标 Camera1 startPreview");
+                    return chain.proceed(args);
+                }
                 File file = HookGuards.getCurrentVideoFile();
-                if (!HookGuards.shouldBypass(packageName, file)) {
-                    HookMain.is_someone_playing = false;
-                    LogUtil.log("【CS】开始预览");
-                    HookMain.start_preview_camera = (Camera) chain.getThisObject();
+                if (HookGuards.shouldBypass(packageName, file)) {
+                    return chain.proceed(args);
+                }
+                HookMain.start_preview_camera = thisCamera;
 
                     try {
                         android.hardware.Camera.Parameters params = HookMain.start_preview_camera.getParameters();
@@ -138,12 +165,23 @@ public class Camera1Handler implements ICameraHandler {
         hookCameraMethod(classLoader, "setPreviewDisplay", new Class<?>[] { SurfaceHolder.class }, chain -> {
             Object[] args = toArgs(chain.getArgs());
             try {
+                Camera thisCamera = (Camera) chain.getThisObject();
+                // Capture first camera if none yet
+                if (HookMain.origin_preview_camera == null) {
+                    HookMain.origin_preview_camera = thisCamera;
+                    LogUtil.log("【CS】创建预览 (setPreviewDisplay)");
+                } else if (!HookMain.origin_preview_camera.equals(thisCamera)) {
+                    // Different camera, skip hijacking
+                    LogUtil.log("【CS】跳过非目标 Camera1 setPreviewDisplay");
+                    return chain.proceed(args);
+                }
+                // Our camera: proceed
                 LogUtil.log("【CS】添加Surfaceview预览");
                 File file = HookGuards.resolveVideoFile(true);
                 if (HookGuards.shouldBypass(packageName, file)) {
                     return chain.proceed(args);
                 }
-                HookMain.mcamera1 = (Camera) chain.getThisObject();
+                HookMain.mcamera1 = thisCamera;
                 HookMain.ori_holder = (SurfaceHolder) args[0];
                 if (HookMain.mSurfacetexture != null) {
                     HookMain.mSurfacetexture = null;
@@ -189,7 +227,13 @@ public class Camera1Handler implements ICameraHandler {
     private void hookCameraTakePicture(ClassLoader classLoader, Class<?>[] parameterTypes) {
         hookCameraMethod(classLoader, "takePicture", parameterTypes, chain -> {
             Object[] args = toArgs(chain.getArgs());
-            if (handlePhotoFake((Camera) chain.getThisObject(), args)) {
+            Camera thisCamera = (Camera) chain.getThisObject();
+            // Only hijack our target camera
+            if (!isOurCamera(thisCamera)) {
+                LogUtil.log("【CS】跳过非目标 Camera1 takePicture");
+                return chain.proceed(args);
+            }
+            if (handlePhotoFake(thisCamera, args)) {
                 return null;
             }
             return chain.proceed(args);

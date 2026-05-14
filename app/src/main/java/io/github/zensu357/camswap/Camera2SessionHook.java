@@ -34,6 +34,7 @@ import android.graphics.Bitmap;
 import android.graphics.Rect;
 import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Method;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 
 import io.github.zensu357.camswap.utils.LogUtil;
@@ -158,6 +159,21 @@ public final class Camera2SessionHook {
             return false;
         }
         return device.equals(cameraDevice);
+    }
+
+    /** Extract CameraDevice from CaptureRequest.Builder via reflection (mCameraDevice field). */
+    public android.hardware.camera2.CameraDevice getBuilderCameraDevice(Object builder) {
+        if (builder == null) {
+            return null;
+        }
+        try {
+            Field f = builder.getClass().getDeclaredField("mCameraDevice");
+            f.setAccessible(true);
+            return (android.hardware.camera2.CameraDevice) f.get(builder);
+        } catch (Throwable t) {
+            // Field not present or inaccessible; likely not a framework builder
+            return null;
+        }
     }
 
     /** Mark virtual surface for recreation on next session creation. */
