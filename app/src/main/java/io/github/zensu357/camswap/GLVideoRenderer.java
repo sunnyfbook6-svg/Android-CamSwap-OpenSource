@@ -40,6 +40,22 @@ public class GLVideoRenderer implements SurfaceTexture.OnFrameAvailableListener 
     private static final int MAX_EGL_RETRIES = 3;
     private volatile int mEglRetryCount = 0;
 
+    // Periodic refresh: re-render last frame at this interval even when no new frame arrives,
+    // preventing the output surface from going grey between MediaPlayer frames.
+    private static final long REFRESH_INTERVAL_MS = 33; // ~30 fps keepalive
+    private volatile boolean mFramePending = false;      // true after first real frame arrives
+    private final Runnable mRefreshRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!mReleased && mInitialized && mFramePending) {
+                drawFrame();
+            }
+            if (!mReleased && mGLHandler != null) {
+                mGLHandler.postDelayed(mRefreshRunnable, REFRESH_INTERVAL_MS);
+            }
+        }
+    };
+
     // EGL
     private EGLDisplay mEGLDisplay = EGL14.EGL_NO_DISPLAY;
     private EGLContext mEGLContext = EGL14.EGL_NO_CONTEXT;
@@ -110,6 +126,8 @@ public class GLVideoRenderer implements SurfaceTexture.OnFrameAvailableListener 
                 initGL();
                 mInitialized = true;
                 LogUtil.log("【CS】【GL】" + mTag + " 初始化成功");
+                // Start keepalive refresh loop so the output surface never goes grey
+                mGLHandler.postDelayed(mRefreshRunnable, REFRESH_INTERVAL_MS);
             } catch (Exception e) {
                 LogUtil.log("【CS】【GL】" + mTag + " 初始化失败: " + e);
                 mInitialized = false;
@@ -160,6 +178,7 @@ public class GLVideoRenderer implements SurfaceTexture.OnFrameAvailableListener 
     public void onFrameAvailable(SurfaceTexture surfaceTexture) {
         if (mReleased || !mInitialized)
             return;
+        mFramePending = true;   // a real frame is now available; allow refresh loop to render
         mGLHandler.post(this::drawFrame);
     }
 
@@ -206,27 +225,53 @@ public class GLVideoRenderer implements SurfaceTexture.OnFrameAvailableListener 
     /**
      * Destroy the current EGL window surface and recreate it from mTargetSurface.
      * Called on the GL thread only.
+     *
+     * Root cause of EGL_BAD_ALLOC (12291): the previous EGLSurface still holds
+     * a reference to the ANativeWindow when eglCreateWindowSurface is called again.
+     * Fix: detach context → destroy surface → brief yield → recreate.
      */
     private void recreateEGLSurface() {
         try {
+            // Step 1: detach context from any surface so the driver releases the native window
             EGL14.eglMakeCurrent(mEGLDisplay,
                     EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+
+            // Step 2: destroy the old EGL surface
             if (mEGLSurface != EGL14.EGL_NO_SURFACE) {
                 EGL14.eglDestroySurface(mEGLDisplay, mEGLSurface);
                 mEGLSurface = EGL14.EGL_NO_SURFACE;
             }
-            if (mTargetSurface != null && mTargetSurface.isValid() && mEGLConfig != null) {
-                int[] surfaceAttribs = { EGL14.EGL_NONE };
-                mEGLSurface = EGL14.eglCreateWindowSurface(
-                        mEGLDisplay, mEGLConfig, mTargetSurface, surfaceAttribs, 0);
-                if (mEGLSurface != EGL14.EGL_NO_SURFACE) {
-                    EGL14.eglMakeCurrent(mEGLDisplay, mEGLSurface, mEGLSurface, mEGLContext);
+
+            if (mTargetSurface == null || !mTargetSurface.isValid() || mEGLConfig == null) {
+                LogUtil.log("【CS】【GL】" + mTag + " recreateEGLSurface: target surface invalid, aborting");
+                return;
+            }
+
+            // Step 3: yield briefly so the driver/platform fully releases the ANativeWindow
+            // before we try to attach a new EGLSurface to it. Without this pause,
+            // eglCreateWindowSurface returns EGL_BAD_ALLOC (0x300B / 12291).
+            try { Thread.sleep(16); } catch (InterruptedException ignored) {}
+
+            // Step 4: recreate
+            int[] surfaceAttribs = { EGL14.EGL_NONE };
+            mEGLSurface = EGL14.eglCreateWindowSurface(
+                    mEGLDisplay, mEGLConfig, mTargetSurface, surfaceAttribs, 0);
+
+            if (mEGLSurface != EGL14.EGL_NO_SURFACE) {
+                if (EGL14.eglMakeCurrent(mEGLDisplay, mEGLSurface, mEGLSurface, mEGLContext)) {
                     LogUtil.log("【CS】【GL】" + mTag + " EGL Surface 重建成功 ✅");
                     mEglRetryCount = 0;
                 } else {
                     int err = EGL14.eglGetError();
-                    LogUtil.log("【CS】【GL】" + mTag + " EGL Surface 重建失败, err=" + err);
+                    LogUtil.log("【CS】【GL】" + mTag + " eglMakeCurrent 失败 err=" + err);
+                    EGL14.eglDestroySurface(mEGLDisplay, mEGLSurface);
+                    mEGLSurface = EGL14.EGL_NO_SURFACE;
                 }
+            } else {
+                int err = EGL14.eglGetError();
+                LogUtil.log("【CS】【GL】" + mTag + " EGL Surface 重建失败, err=" + err
+                        + " (0x300B=EGL_BAD_ALLOC — native window still busy?)");
+                // Schedule another attempt via the existing retry mechanism in drawFrame()
             }
         } catch (Exception e) {
             LogUtil.log("【CS】【GL】" + mTag + " recreateEGLSurface 异常: " + e);
@@ -485,6 +530,7 @@ public class GLVideoRenderer implements SurfaceTexture.OnFrameAvailableListener 
         mReleased = true;
         CountDownLatch releaseLatch = new CountDownLatch(1);
         if (mGLHandler != null) {
+            mGLHandler.removeCallbacks(mRefreshRunnable);
             mGLHandler.post(() -> {
                 try {
                     releaseInternal();
