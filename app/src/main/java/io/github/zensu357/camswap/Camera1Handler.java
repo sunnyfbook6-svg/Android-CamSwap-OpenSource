@@ -491,7 +491,19 @@ public class Camera1Handler implements ICameraHandler {
         hookCameraMethod(classLoader, "addCallbackBuffer", new Class<?>[] { byte[].class }, chain -> {
             Object[] args = toArgs(chain.getArgs());
             if (args[0] != null) {
-                args[0] = new byte[((byte[]) args[0]).length];
+                Object thisObj = chain.getThisObject();
+                boolean isTargetCamera = false;
+                if (thisObj != null) {
+                    if (thisObj.equals(HookMain.origin_preview_camera) ||
+                        thisObj.equals(HookMain.start_preview_camera) ||
+                        thisObj.equals(HookMain.mcamera1) ||
+                        thisObj.equals(HookMain.camera_onPreviewFrame)) {
+                        isTargetCamera = true;
+                    }
+                }
+                if (isTargetCamera) {
+                    args[0] = new byte[((byte[]) args[0]).length];
+                }
             }
             return chain.proceed(args);
         });
