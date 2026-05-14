@@ -548,20 +548,59 @@ public final class Camera2SessionHook {
         setBypassCurrentSession(false);
     }
 
+    /**
+     * Called at the top of every createCaptureSession variant.
+     * Clears preview/reader surface slots so that rememberPreviewSurface() and
+     * rememberReaderPlaybackSurface() will accept the new surfaces Giggle passes in.
+     * Also resets the "surfaces unchanged" guard so startPlayback() won't skip re-init.
+     *
+     * Background: onOpened fires only once per CameraDevice lifetime. When Giggle
+     * navigates away and comes back it reuses the same CameraDevice and calls
+     * createCaptureSession again with brand-new Surfaces. Without this reset,
+     * the old (dead) Surface references stay in previewSurface/readerSurface and
+     * the new Surfaces are silently ignored, leaving GLVideoRenderer rendering into
+     * a dead ANativeWindow → EGL_BAD_NATIVE_WINDOW → renderer stops → grey screen.
+     */
+    private void resetSurfaceSlotsForNewSession() {
+        previewSurface = null;
+        previewSurface1 = null;
+        readerSurface = null;
+        readerSurface1 = null;
+        // Invalidate the surface-unchanged guard so startPlayback() will re-init players
+        lastInitPreview = null;
+        lastInitPreview1 = null;
+        lastInitReader = null;
+        lastInitReader1 = null;
+        sessionKeptYuvSurfaces.clear();
+        pendingPlayback = false;
+    }
+
     public void rememberPreviewSurface(Surface surface) {
         if (surface == null || isTrackedReaderSurface(surface)) {
             return;
         }
         if (previewSurface == null) {
             previewSurface = surface;
-        } else if (!previewSurface.equals(surface) && previewSurface1 == null) {
-            // For packages without fake YUV bridge support, only use one preview surface to avoid
-            // rendering RGBA to untracked ImageReader surfaces (CameraX apps
-            // like LINE may expose a second reader-backed target here).
-            if (shouldUseFakeYuvBridgeForPackage(getCurrentPackageName())) {
-                previewSurface1 = surface;
-            } else {
-                LogUtil.log("【CS】跳过第二个 preview surface (无 YUV 兼容): " + surface);
+        } else if (!previewSurface.equals(surface)) {
+            // The stored surface differs from the incoming one. This happens when Giggle
+            // reuses its CameraDevice across an activity switch: onOpened does not re-fire,
+            // so our surface slots still hold the old (now dead) Surface references.
+            // Instead of silently ignoring the new surface, update the GL renderer.
+            if (!previewSurface.isValid()) {
+                // Old surface is dead — replace it and notify the renderer to rebind.
+                LogUtil.log("【CS】previewSurface 已失效，切换至新 Surface: " + surface);
+                previewSurface = surface;
+                MediaPlayerManager pm = HookMain.playerManager;
+                if (pm.c2_renderer != null) {
+                    pm.c2_renderer.updateTargetSurface(surface);
+                }
+            } else if (previewSurface1 == null) {
+                // Old surface still valid — genuine second preview surface.
+                if (shouldUseFakeYuvBridgeForPackage(getCurrentPackageName())) {
+                    previewSurface1 = surface;
+                } else {
+                    LogUtil.log("【CS】跳过第二个 preview surface (无 YUV 兼容): " + surface);
+                }
             }
         }
         if (pendingPlayback) {
@@ -802,6 +841,7 @@ public final class Camera2SessionHook {
                         }
                         LogUtil.log("【CS】createCaptureSession(List) outputs=" + ((List<?>) args[0]).size());
                         if (!isCurrentSessionBypassed()) {
+                            resetSurfaceSlotsForNewSession();
                             args[0] = rewriteSessionSurfaces((List<?>) args[0]);
                         }
                         if (args[1] != null)
@@ -836,6 +876,7 @@ public final class Camera2SessionHook {
                                 disableSessionBypass();
                             }
                             if (!isCurrentSessionBypassed()) {
+                                resetSurfaceSlotsForNewSession();
                                 args[0] = rewriteOutputConfigurations((List<?>) args[0]);
                             }
                             LogUtil.log("【CS】createCaptureSession(OutputConfigurations)");
@@ -870,6 +911,7 @@ public final class Camera2SessionHook {
                             disableSessionBypass();
                         }
                         if (!isCurrentSessionBypassed()) {
+                            resetSurfaceSlotsForNewSession();
                             args[0] = rewriteSessionSurfaces((List<?>) args[0]);
                         }
                         LogUtil.log("【CS】createCaptureSession(HighSpeed)");
@@ -905,6 +947,7 @@ public final class Camera2SessionHook {
                                 disableSessionBypass();
                             }
                             if (!isCurrentSessionBypassed()) {
+                                resetSurfaceSlotsForNewSession();
                                 args[1] = rewriteSessionSurfaces((List<?>) args[1]);
                             }
                             LogUtil.log("【CS】createCaptureSession(Reprocessable)");
@@ -942,6 +985,7 @@ public final class Camera2SessionHook {
                                 disableSessionBypass();
                             }
                             if (!isCurrentSessionBypassed()) {
+                                resetSurfaceSlotsForNewSession();
                                 args[1] = rewriteOutputConfigurations((List<?>) args[1]);
                             }
                             LogUtil.log("【CS】createCaptureSession(ReprocessableByConfigs)");
@@ -980,6 +1024,7 @@ public final class Camera2SessionHook {
                                 disableSessionBypass();
                             }
                             if (!isCurrentSessionBypassed()) {
+                                resetSurfaceSlotsForNewSession();
                                 fakeSessionConfig = rewriteSessionConfiguration(realSessionConfig);
                                 args[0] = fakeSessionConfig;
                             }
