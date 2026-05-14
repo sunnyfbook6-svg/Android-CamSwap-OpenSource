@@ -61,14 +61,21 @@ public class Camera2Handler implements ICameraHandler {
             Api101Runtime.requireModule().hook(method).intercept(chain -> {
                 Object[] args = toArgs(chain.getArgs());
                 try {
-                    if (args[1] != null && !args[1].equals(HookMain.c2_state_cb)) {
-                        HookMain.c2_state_cb = (CameraDevice.StateCallback) args[1];
-                        HookMain.c2_state_callback = args[1].getClass();
+                    if (args[1] != null) {
                         File file = HookGuards.resolveVideoFile(true);
                         if (!HookGuards.shouldBypass(packageName, file)) {
-                            LogUtil.log("【CS】1位参数初始化相机，类：" + HookMain.c2_state_callback.toString());
+                            // Always reset isFirstHookBuild on every openCamera call so that
+                            // build() → process_camera2_play() fires for the new session,
+                            // even when Giggle reuses the same StateCallback instance.
                             HookMain.camera2Hook.isFirstHookBuild = true;
-                            HookMain.process_camera2_init(HookMain.c2_state_callback);
+                            if (!args[1].equals(HookMain.c2_state_cb)) {
+                                HookMain.c2_state_cb = (CameraDevice.StateCallback) args[1];
+                                HookMain.c2_state_callback = args[1].getClass();
+                                LogUtil.log("【CS】1位参数初始化相机，类：" + HookMain.c2_state_callback.toString());
+                                HookMain.process_camera2_init(HookMain.c2_state_callback);
+                            } else {
+                                LogUtil.log("【CS】1位参数重新打开相机（同一 StateCallback），重置播放状态");
+                            }
                         }
                     }
                 } catch (Throwable t) {
@@ -94,14 +101,19 @@ public class Camera2Handler implements ICameraHandler {
                 Object[] args = toArgs(chain.getArgs());
                 Object result = chain.proceed(args);
                 try {
-                    if (args[2] != null && !args[2].equals(HookMain.c2_state_cb)) {
-                        HookMain.c2_state_cb = (CameraDevice.StateCallback) args[2];
+                    if (args[2] != null) {
                         File file = HookGuards.resolveVideoFile(true);
                         if (!HookGuards.shouldBypass(packageName, file)) {
-                            HookMain.c2_state_callback = args[2].getClass();
-                            LogUtil.log("【CS】2位参数初始化相机，类：" + HookMain.c2_state_callback.toString());
+                            // Always reset isFirstHookBuild on every openCamera call.
                             HookMain.camera2Hook.isFirstHookBuild = true;
-                            HookMain.process_camera2_init(HookMain.c2_state_callback);
+                            if (!args[2].equals(HookMain.c2_state_cb)) {
+                                HookMain.c2_state_cb = (CameraDevice.StateCallback) args[2];
+                                HookMain.c2_state_callback = args[2].getClass();
+                                LogUtil.log("【CS】2位参数初始化相机，类：" + HookMain.c2_state_callback.toString());
+                                HookMain.process_camera2_init(HookMain.c2_state_callback);
+                            } else {
+                                LogUtil.log("【CS】2位参数重新打开相机（同一 StateCallback），重置播放状态");
+                            }
                         }
                     }
                 } catch (Throwable t) {
@@ -225,14 +237,19 @@ public class Camera2Handler implements ICameraHandler {
                     boolean isNewBuilder = thisObject != null
                             && !thisObject.equals(HookMain.camera2Hook.captureBuilder);
                     boolean hasPending = HookMain.camera2Hook.pendingPlayback;
-                    if (thisObject != null && (isNewBuilder || hasPending)) {
+                    // Also trigger on isFirstHookBuild: covers the case where Giggle reuses
+                    // the same CaptureRequest.Builder instance across sessions (isNewBuilder=false)
+                    // but a new camera session has just been configured.
+                    boolean isFirstBuild = HookMain.camera2Hook.isFirstHookBuild;
+                    if (thisObject != null && (isNewBuilder || hasPending || isFirstBuild)) {
                         HookMain.camera2Hook.captureBuilder = (CaptureRequest.Builder) thisObject;
                         if (!HookGuards.shouldBypass(packageName, HookGuards.getCurrentVideoFile())) {
                             if (HookMain.camera2Hook.isCurrentSessionBypassed()) {
                                 LogUtil.log("【CS】当前会话已旁路，跳过虚拟播放启动");
                             } else {
                                 LogUtil.log("【CS】开始build请求"
-                                        + (hasPending ? " (延迟重试)" : ""));
+                                        + (hasPending ? " (延迟重试)" : "")
+                                        + (isFirstBuild ? " (首次build)" : ""));
                                 if (VideoManager.getConfig().getBoolean(ConfigManager.KEY_ENABLE_PHOTO_FAKE, false)
                                         && HookMain.camera2Hook.pendingPhotoSurface != null
                                         && HookMain.camera2Hook.isJpegReaderSurface(
